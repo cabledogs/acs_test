@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +61,8 @@ func pct(d []time.Duration, p float64) time.Duration {
 	return d[int(float64(len(d)-1)*p)]
 }
 
+func dur(d time.Duration) string { return d.Truncate(100 * time.Millisecond).String() }
+
 func ms(d time.Duration) string { return strconv.FormatInt(d.Milliseconds(), 10) }
 
 type Stats struct {
@@ -67,14 +70,27 @@ type Stats struct {
 	authChallenges, crReceived, rpcTotal          atomic.Int64
 	bytesOut, bytesIn, bytesDownloaded            atomic.Int64
 	sessionLat, informLat                         latRec
+	gotIn                                         atomic.Int64
+	gotInLat                                      latRec
+	total                                         int
 
-	mu   sync.Mutex
-	rpcs map[string]int64
-	errs map[string]int64
+	mu       sync.Mutex
+	rpcs     map[string]int64
+	errs     map[string]int64
+	attempts map[int]int64
 }
 
-func newStats() *Stats {
-	return &Stats{rpcs: map[string]int64{}, errs: map[string]int64{}}
+func newStats(total int) *Stats {
+	return &Stats{total: total, rpcs: map[string]int64{}, errs: map[string]int64{}, attempts: map[int]int64{}}
+}
+
+// recordGotIn is called once per CPE when its first session succeeds.
+func (s *Stats) recordGotIn(sinceBoot time.Duration, attempts int) {
+	s.gotIn.Add(1)
+	s.gotInLat.add(sinceBoot)
+	s.mu.Lock()
+	s.attempts[attempts]++
+	s.mu.Unlock()
 }
 
 func (s *Stats) countRPC(m string) {
@@ -88,6 +104,9 @@ func (s *Stats) recordError(err error) {
 	msg := err.Error()
 	if len(msg) > 160 {
 		msg = msg[:160]
+	}
+	if isClientSide(msg) {
+		msg = "[CLIENT-SIDE, not the ACS] " + msg
 	}
 	s.mu.Lock()
 	s.errs[msg]++
@@ -104,7 +123,7 @@ func (s *Stats) report(ctx context.Context, done <-chan struct{}, cfg *Config) {
 		}
 		defer f.Close()
 		w = csv.NewWriter(f)
-		w.Write([]string{"time", "elapsed_s", "active", "ok", "failed", "ok_per_s", "fail_per_s", "rpcs",
+		w.Write([]string{"time", "elapsed_s", "devices_in", "active", "ok", "failed", "ok_per_s", "fail_per_s", "rpcs",
 			"inform_p50_ms", "inform_p95_ms", "inform_p99_ms", "session_p50_ms", "session_p95_ms", "session_p99_ms"})
 		defer w.Flush()
 	}
@@ -122,12 +141,12 @@ func (s *Stats) report(ctx context.Context, done <-chan struct{}, cfg *Config) {
 		lastOK, lastFail, lastRPC = ok, fail, rpc
 		inf, ses := s.informLat.takeWindow(), s.sessionLat.takeWindow()
 		el := now.Sub(start).Truncate(time.Second)
-		log.Printf("%8s | active %5d | ok %8d (%7.1f/s) | fail %6d (+%d) | rpcs +%-5d | inform p50/95/99 %s/%s/%s ms | session p50/95/99 %s/%s/%s ms",
-			el, s.active.Load(), ok, float64(dOK)/dt, fail, dFail, dRPC,
+		log.Printf("%8s | in %6d/%d (%5.1f%%) | active %5d | ok %8d (%7.1f/s) | fail %6d (+%d) | rpcs +%-5d | inform p50/95/99 %s/%s/%s ms | session p50/95/99 %s/%s/%s ms",
+			el, s.gotIn.Load(), s.total, 100*float64(s.gotIn.Load())/float64(s.total), s.active.Load(), ok, float64(dOK)/dt, fail, dFail, dRPC,
 			ms(pct(inf, .5)), ms(pct(inf, .95)), ms(pct(inf, .99)),
 			ms(pct(ses, .5)), ms(pct(ses, .95)), ms(pct(ses, .99)))
 		if w != nil {
-			w.Write([]string{now.Format(time.RFC3339), fmt.Sprintf("%.0f", el.Seconds()), strconv.FormatInt(s.active.Load(), 10),
+			w.Write([]string{now.Format(time.RFC3339), fmt.Sprintf("%.0f", el.Seconds()), strconv.FormatInt(s.gotIn.Load(), 10), strconv.FormatInt(s.active.Load(), 10),
 				strconv.FormatInt(ok, 10), strconv.FormatInt(fail, 10),
 				fmt.Sprintf("%.2f", float64(dOK)/dt), fmt.Sprintf("%.2f", float64(dFail)/dt), strconv.FormatInt(dRPC, 10),
 				ms(pct(inf, .5)), ms(pct(inf, .95)), ms(pct(inf, .99)),
@@ -183,8 +202,39 @@ func (s *Stats) summary(elapsed time.Duration) {
 			ms(a[0]), ms(pct(a, .5)), ms(pct(a, .9)), ms(pct(a, .95)), ms(pct(a, .99)), ms(a[len(a)-1]))
 	}
 
+	if a := s.gotInLat.total(); len(a) > 0 {
+		in := s.gotIn.Load()
+		fmt.Printf("\nDevices that got in  %d of %d (%.1f%%), %d never got in\n", in, s.total, 100*float64(in)/float64(s.total), int64(s.total)-in)
+		fmt.Println("Time from boot until the device's first successful session:")
+		fmt.Printf("  fastest %s  p50 %s  p90 %s  p95 %s  p99 %s  slowest %s\n",
+			dur(a[0]), dur(pct(a, .5)), dur(pct(a, .9)), dur(pct(a, .95)), dur(pct(a, .99)), dur(a[len(a)-1]))
+		fmt.Println("  % of ALL devices in by:")
+		for _, p := range []float64{.25, .5, .75, .9, .95, .99, 1} {
+			n := int(p * float64(s.total))
+			if n < 1 {
+				n = 1
+			}
+			if n <= len(a) {
+				fmt.Printf("    %5.1f%%  %s\n", p*100, dur(a[n-1]))
+			} else {
+				fmt.Printf("    %5.1f%%  never (only %d got in)\n", p*100, len(a))
+			}
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.attempts) > 0 {
+		fmt.Println("\nAttempts needed to get in:")
+		keys := make([]int, 0, len(s.attempts))
+		for k := range s.attempts {
+			keys = append(keys, k)
+		}
+		sort.Ints(keys)
+		for _, k := range keys {
+			fmt.Printf("  %3d attempt(s)  %7d devices\n", k, s.attempts[k])
+		}
+	}
 	if len(s.rpcs) > 0 {
 		fmt.Println("\nRPCs received from ACS:")
 		for _, kv := range sortedCounts(s.rpcs) {
@@ -200,6 +250,19 @@ func (s *Stats) summary(elapsed time.Duration) {
 			fmt.Printf("  %8d  %s\n", kv.v, kv.k)
 		}
 	}
+}
+
+// isClientSide spots errors caused by the load-generating machine running out
+// of sockets/ports rather than by the ACS.
+func isClientSide(msg string) bool {
+	m := strings.ToLower(msg)
+	for _, s := range []string{"bind:", "buffer space", "only one usage of each socket", "too many open files",
+		"address already in use", "cannot assign requested address", "no buffer space"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
 }
 
 type kv struct {

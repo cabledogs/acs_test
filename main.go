@@ -18,20 +18,22 @@ import (
 )
 
 type Config struct {
-	ACSURL, User, Pass                     string
-	Count, StartIndex, SerialDigits        int
-	SerialPrefix, OUI, ProductClass        string
-	Manufacturer, ModelName                string
-	SWVersion, HWVersion, DataModel        string
-	CWMPNS                                 string
-	Interval, Ramp, Duration, Timeout      time.Duration
-	BootDelay, Report                      time.Duration
-	Jitter                                 float64
-	Bootstrap, Once, Insecure              bool
-	SharedConns, FetchDownloads, LogErrors bool
-	MaxSessions, ExtraParams, Trace        int
-	CRPort                                 int
-	CRHost, CSV, BindIPs                   string
+	ACSURL, User, Pass                      string
+	Count, StartIndex, SerialDigits         int
+	SerialPrefix, OUI, ProductClass         string
+	Manufacturer, ModelName                 string
+	SWVersion, HWVersion, DataModel         string
+	CWMPNS                                  string
+	Interval, Ramp, Duration, Timeout       time.Duration
+	BootDelay, Report                       time.Duration
+	Jitter                                  float64
+	Bootstrap, Once, UntilSuccess, Insecure bool
+	RetryMinWait                            time.Duration
+	RetryMultiplier                         int
+	SharedConns, FetchDownloads, LogErrors  bool
+	MaxSessions, ExtraParams, Trace         int
+	CRPort                                  int
+	CRHost, CSV, BindIPs                    string
 }
 
 type Sim struct {
@@ -70,6 +72,9 @@ func main() {
 	flag.DurationVar(&cfg.BootDelay, "boot-delay", 5*time.Second, "simulated reboot time after Reboot/FactoryReset/firmware Download")
 	flag.BoolVar(&cfg.Bootstrap, "bootstrap", true, "send 0 BOOTSTRAP in the first Inform")
 	flag.BoolVar(&cfg.Once, "once", false, "each CPE does a single session and exits (burst test)")
+	flag.BoolVar(&cfg.UntilSuccess, "until-success", false, "boot storm: each CPE retries (TR-069 backoff) until one session succeeds, then exits; reports time-to-get-in")
+	flag.DurationVar(&cfg.RetryMinWait, "retry-min-wait", 5*time.Second, "CWMPRetryMinimumWaitInterval: base wait before the first retry")
+	flag.IntVar(&cfg.RetryMultiplier, "retry-multiplier", 2000, "CWMPRetryIntervalMultiplier (2000 = wait doubles each retry)")
 	flag.IntVar(&cfg.MaxSessions, "max-sessions", 0, "max concurrent sessions (0 = unlimited)")
 	flag.BoolVar(&cfg.Insecure, "insecure", false, "skip TLS certificate verification")
 	flag.BoolVar(&cfg.SharedConns, "shared-conns", false, "share a keep-alive connection pool across CPEs (fewer sockets, less realistic)")
@@ -98,11 +103,14 @@ func main() {
 	if cfg.DataModel != "tr181" && cfg.DataModel != "tr098" {
 		log.Fatalf("-datamodel must be tr181 or tr098")
 	}
+	if cfg.RetryMinWait <= 0 || cfg.RetryMultiplier < 1000 {
+		log.Fatalf("-retry-min-wait must be > 0 and -retry-multiplier >= 1000")
+	}
 	if cfg.Count < 1 || cfg.Interval < time.Second {
 		log.Fatalf("-n must be >= 1 and -interval >= 1s")
 	}
 
-	sim := &Sim{cfg: cfg, stats: newStats(), cpes: map[string]*CPE{}}
+	sim := &Sim{cfg: cfg, stats: newStats(cfg.Count), cpes: map[string]*CPE{}}
 	for _, s := range strings.Split(cfg.BindIPs, ",") {
 		if s = strings.TrimSpace(s); s != "" {
 			ip := net.ParseIP(s)
@@ -146,7 +154,9 @@ func main() {
 
 	log.Printf("ACS %s | %d CPEs (%s..%s) | datamodel %s | interval %s | ramp %s",
 		cfg.ACSURL, cfg.Count, cpes[0].serial, cpes[len(cpes)-1].serial, cfg.DataModel, cfg.Interval, cfg.Ramp)
-	if !cfg.Once {
+	if cfg.UntilSuccess {
+		log.Printf("boot storm: every CPE retries until it gets in (retry wait %s x %.1f^n, randomized)", cfg.RetryMinWait, float64(cfg.RetryMultiplier)/1000)
+	} else if !cfg.Once {
 		log.Printf("expected steady-state load: %.1f informs/sec", float64(cfg.Count)/cfg.Interval.Seconds())
 	}
 	if cfg.CRPort > 0 {

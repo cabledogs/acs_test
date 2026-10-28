@@ -11,7 +11,7 @@ Each simulated CPE:
   AddObject, DeleteObject, Reboot, FactoryReset, Download (then TransferComplete), ScheduleInform
 - keeps its own TR-181 (`Device.`) or TR-098 (`InternetGatewayDevice.`) data model. Values the ACS sets are kept,
   and a change to `PeriodicInformInterval` changes how often the CPE informs
-- retries failed sessions with TR-069 style backoff
+- retries failed sessions with the TR-069 backoff (section 3.2.1.1)
 
 ## Quick start (Windows)
 
@@ -38,6 +38,27 @@ Same, but at most 500 sessions in flight:
 ```
 cpesim.exe -acs http://acs:7547/ -n 5000 -once -ramp 0 -max-sessions 500
 ```
+
+### Boot storm until everyone is in (time-to-recover test)
+
+Every CPE boots at the same moment and keeps retrying with the TR-069 backoff until its session
+succeeds. The program exits when all CPEs are in, or when `-duration` runs out.
+```
+cpesim.exe -acs http://acs:7547/ -user u -pass p -n 14000 -until-success -ramp 0 -csv storm.csv
+```
+Each report line shows how many devices are in so far, for example `in 10134/14000 (72.4%)`. The final summary shows:
+- time from boot to each device's first successful session (p50/p90/p95/p99/slowest)
+- how long until 25/50/75/90/95/99/100% of all devices were in
+- a histogram of how many attempts devices needed
+- the error breakdown (HTTP 503, timeouts, connection refused, ...). Errors caused by the test PC
+  running out of sockets are labelled `[CLIENT-SIDE, not the ACS]`. If you see those, the result
+  measures your PC and not the ACS. See *Windows tuning* below.
+
+The retry waits follow TR-069 section 3.2.1.1: retry *n* waits a random time in
+`[m·k^(n-1), m·k^n)`, where `m = -retry-min-wait` (default 5s) and `k = -retry-multiplier/1000` (default 2000 → 2).
+That gives 5–10s, 10–20s, 20–40s ... capped at 2560–5120s from the 10th retry. Set these to match the
+`CWMPRetryMinimumWaitInterval`/`CWMPRetryIntervalMultiplier` your real devices use. Real devices don't all
+boot within the same millisecond, so `-ramp 30s` (spread the boots over 30s) is often more realistic than `-ramp 0`.
 
 Run a second machine or process with a different serial range so the CPEs do not collide:
 ```
@@ -73,6 +94,9 @@ through Windows Firewall. The simulator does not check connection request creden
 | `-ramp` | 1m | spread first informs over this time (0 = all at once) |
 | `-duration` | 0 | stop after this long (0 = until Ctrl+C) |
 | `-once` | false | one session per CPE, then exit |
+| `-until-success` | false | boot storm: retry until one session succeeds, then exit; reports time-to-get-in |
+| `-retry-min-wait` | 5s | CWMPRetryMinimumWaitInterval |
+| `-retry-multiplier` | 2000 | CWMPRetryIntervalMultiplier (2000 = doubles each retry) |
 | `-bootstrap` | true | include `0 BOOTSTRAP` in the first inform (`-bootstrap=false` to disable) |
 | `-max-sessions` | 0 | limit concurrent sessions |
 | `-timeout` | 30s | per HTTP request timeout |

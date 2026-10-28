@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -44,6 +45,9 @@ type CPE struct {
 	periodicEnabled       bool
 	events                []event
 	retry                 int
+	attempts              int
+	bootAt                time.Time
+	gotIn                 bool
 	msgID                 int
 	transfer              *transfer
 	pendingDL             *download
@@ -241,21 +245,27 @@ func (c *CPE) run(ctx context.Context, startDelay time.Duration) {
 	if !sleepCtx(ctx, startDelay) {
 		return
 	}
+	c.bootAt = time.Now()
 	if cfg.Bootstrap {
 		c.addEvent("0 BOOTSTRAP", "")
 	}
 	c.addEvent("1 BOOT", "")
 	for {
+		c.attempts++
 		err := c.sim.runSession(ctx, c)
 		if ctx.Err() != nil {
 			return
 		}
 		if err == nil {
 			c.retry = 0
+			if !c.gotIn {
+				c.gotIn = true
+				c.sim.stats.recordGotIn(time.Since(c.bootAt), c.attempts)
+			}
 		} else {
 			c.retry++
 		}
-		if cfg.Once {
+		if cfg.Once || (cfg.UntilSuccess && err == nil) {
 			return
 		}
 
@@ -312,7 +322,7 @@ func (c *CPE) run(ctx context.Context, startDelay time.Duration) {
 		periodic := false
 		switch {
 		case err != nil:
-			wait = retryBackoff(c.retry, c.interval)
+			wait = retryBackoff(c.retry, cfg.RetryMinWait, cfg.RetryMultiplier)
 		case c.periodicEnabled:
 			wait, periodic = jitter(c.interval, cfg.Jitter), true
 		default:
@@ -348,19 +358,21 @@ func (c *CPE) run(ctx context.Context, startDelay time.Duration) {
 	}
 }
 
-// retryBackoff follows the TR-069 session retry policy (5s * 2^n, randomized), capped.
-func retryBackoff(retry int, interval time.Duration) time.Duration {
+// retryBackoff implements the TR-069 session retry policy (section 3.2.1.1):
+// the wait for retry n is random in [m*k^(n-1), m*k^n), with n capped at 10,
+// where m = CWMPRetryMinimumWaitInterval and k = CWMPRetryIntervalMultiplier/1000.
+// With the defaults (5s, 2000) that is 5-10s, 10-20s, 20-40s ... 2560-5120s.
+func retryBackoff(retry int, minWait time.Duration, multiplier int) time.Duration {
 	if retry < 1 {
 		retry = 1
 	}
-	if retry > 8 {
-		retry = 8
+	if retry > 10 {
+		retry = 10
 	}
-	d := time.Duration(5<<uint(retry-1)) * time.Second
-	if d > interval {
-		d = interval
-	}
-	return d + time.Duration(rand.Int63n(int64(d)/2+1))
+	k := float64(multiplier) / 1000
+	lo := float64(minWait) * math.Pow(k, float64(retry-1))
+	hi := lo * k
+	return time.Duration(lo + rand.Float64()*(hi-lo))
 }
 
 func jitter(d time.Duration, frac float64) time.Duration {
